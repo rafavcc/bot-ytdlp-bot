@@ -74,7 +74,7 @@ def is_reddit(url: str) -> bool:
 def reddit_post(url: str):
     """Fetch a Reddit post's JSON the way yt-dlp's extractor does (impersonated browser
     request + logged-in cookies). Returns (clean_post_url, post_data)."""
-    imp = {"impersonate": ImpersonateTarget.from_str("brave")}
+    imp = {"impersonate": ImpersonateTarget.from_str("chrome")}
     opts = {"cookiesfrombrowser": ("brave",), "quiet": True, "logger": _YtdlpLogger()}
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.cookiejar.set_cookie(http.cookiejar.Cookie(
@@ -107,6 +107,21 @@ def reddit_image_urls(data: dict) -> list:
         if (urlparse(link).hostname or "").endswith("redd.it"):
             urls.append(link)
     return urls
+
+
+REDGIFS_THUMB_RE = re.compile(r"^https?://i\.redgifs\.com/i/(\w+)")
+
+
+def external_media_url(data: dict):
+    """The off-Reddit link a post points to (RedGifs, Imgur, YouTube...), or None.
+    Giving yt-dlp this link avoids its Reddit extractor, which Reddit often blocks."""
+    link = data.get("url_overridden_by_dest") or ""
+    if not link.startswith("http") or is_reddit(link) or "redd.it" in (urlparse(link).hostname or ""):
+        return None
+    # i.redgifs.com/i/<id>.jpg is only a thumbnail; the watch page has the real media
+    if m := REDGIFS_THUMB_RE.match(link):
+        return f"https://www.redgifs.com/watch/{m.group(1)}"
+    return link
 
 
 def download_direct(url: str, folder: Path) -> Path:
@@ -172,7 +187,7 @@ def download(url: str, folder: Path) -> list:
                 if links:
                     log.info("Reddit direct download: %s", links)
                     return [download_direct(link, folder) for link in links]
-            url = post_url
+            url = external_media_url(data) or post_url
     return [download_ytdlp(url, folder)]
 
 
@@ -199,6 +214,26 @@ def compress_to_hevc(path: Path) -> Path:
         raise RuntimeError(f"ffmpeg failed: {result.stderr[-300:]}")
     path.unlink(missing_ok=True)
     return target
+
+
+def shrink(path: Path) -> Path:
+    """Run `media-organizer shrink` on the file and return where it is now. Images become
+    WebP; videos, animations and conversions that don't help keep the original file."""
+    try:
+        result = subprocess.run(["media-organizer", "shrink", str(path)],
+                                capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log.warning("shrink failed for %s: %s", path.name, e)
+        return path
+    # Output looks like: "ok /dir/a.jpg -> a.webp (msg)" or "skipped /dir/a.mp4 (msg)"
+    line = result.stdout.strip()
+    log.info("shrink: %s", line or result.stderr.strip()[-300:])
+    if line.startswith("ok ") and " -> " in line:
+        new_name = line.split(" -> ", 1)[1].rsplit(" (", 1)[0]
+        new_path = path.with_name(new_name)
+        if new_path.is_file():
+            return new_path
+    return path
 
 
 async def send_file(msg, path: Path):
@@ -232,6 +267,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             paths = await asyncio.to_thread(download, url, folder)
             await status.edit_text("Uploading ...")
             for path in paths:
+                path = await asyncio.to_thread(shrink, path)
                 if path.stat().st_size > MAX_BYTES:
                     await status.edit_text(f"{path.name} is over 50 MB, converting to HEVC ...")
                     path = await asyncio.to_thread(compress_to_hevc, path)
